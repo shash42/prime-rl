@@ -39,6 +39,7 @@ dependencies = [
     "dion",
     "tilelang>=0.1.8",
     "flash-linear-attention",
+    "causal-conv1d==1.6.2.post1",
     "nvidia-ml-py>=12.575.51",
     "pybase64>=1.4.2",
     "orjson>=3.10",
@@ -110,7 +111,7 @@ dev = [
 # *without* the cooldown — bypassing this security policy.
 required-version = ">=0.11.1"
 exclude-newer = "7 days"
-no-build-isolation-package = ["flash-attn"]
+no-build-isolation-package = ["flash-attn", "causal-conv1d"]
 environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'",
     "sys_platform == 'linux' and platform_machine == 'aarch64'",
@@ -215,10 +216,12 @@ flash_attn_3 = { index = "pytorch-cu128-test" }
 [tool.uv.extra-build-dependencies]
 flash-attn = [{ requirement = "torch", match-runtime = true }]
 flash-attn-3 = [{ requirement = "torch", match-runtime = true }]
+causal-conv1d = [{ requirement = "torch", match-runtime = true }]
 mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 
 [tool.uv.extra-build-variables]
 flash-attn = { FLASH_ATTENTION_SKIP_CUDA_BUILD = "TRUE" }
+causal-conv1d = { CAUSAL_CONV1D_FORCE_BUILD = "TRUE", MAX_JOBS = "2" }
 
 [[tool.uv.index]]
 name = "pytorch-cu128"

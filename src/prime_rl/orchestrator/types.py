@@ -99,16 +99,47 @@ class Rollout(vf.Trace[DataT], Generic[DataT]):
     eval_step: int | None = Field(default=None, exclude=True)
 
     def to_record(self) -> dict:
-        """The plain trace record plus the orchestration metadata (excluded from the pydantic
-        dump), so a record stays fully placeable — kind, env, policy — even when trace files
-        are merged or read away from their paths. ``eval_step`` is the eval trigger step (None
-        for train rollouts)."""
-        return super().to_record() | {
+        """Readable trajectory plus orchestration metadata for the archive.
+
+        Token IDs, masks, and logprobs remain in the trainer wire payload but
+        are omitted from the research artifact.
+        """
+        record = super().to_record()
+        for node in record["nodes"]:
+            for field in ("token_ids", "mask", "is_content", "logprobs"):
+                node.pop(field, None)
+        return record | {
             "kind": self.kind,
             "env_name": self.env_name,
             "group_id": str(self.group_id),
             "policy_version": self.policy_version,
+            "off_policy_steps": self.off_policy_steps,
+            "is_filtered": self.is_filtered,
+            "filter_results": self.filter_results,
+            "scalar_advantage": self.scalar_advantage(),
             "eval_step": self.eval_step,
+        }
+
+    def to_summary_record(self) -> dict:
+        """Compact action/reward trajectory without token-level message nodes."""
+        return {
+            "id": self.id,
+            "kind": self.kind,
+            "env_name": self.env_name,
+            "group_id": str(self.group_id),
+            "policy_version": self.policy_version,
+            "off_policy_steps": self.off_policy_steps,
+            "is_filtered": self.is_filtered,
+            "filter_results": self.filter_results,
+            "scalar_advantage": self.scalar_advantage(),
+            "eval_step": self.eval_step,
+            "task_idx": self.task.data.idx,
+            "rewards": self.rewards,
+            "metrics": self.metrics,
+            "is_completed": self.is_completed,
+            "stop_condition": self.stop_condition,
+            "errors": [error.model_dump(mode="json") for error in self.errors],
+            "actions": self.info.get("process_rewards", []),
         }
 
     def assign_advantages(self, values: float | list[float]) -> None:

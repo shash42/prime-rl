@@ -1,8 +1,10 @@
 import asyncio
 import ctypes
 import gc
+import gzip
 import logging
 import math
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -59,6 +61,36 @@ def save_rollouts(rollouts: list[dict], path: Path) -> None:
     with open(path, "ab") as f:
         for rollout in rollouts:
             f.write(orjson.dumps(rollout, default=str, option=opts))
+
+
+def compress_rollouts(path: Path) -> None:
+    """Atomically gzip a completed trace stream, retaining the source on failure."""
+    if not path.exists():
+        return
+    compressed_path = path.with_suffix(path.suffix + ".gz")
+    tmp_path = compressed_path.with_suffix(compressed_path.suffix + ".tmp")
+    try:
+        with tmp_path.open("wb") as target:
+            if compressed_path.exists():
+                with compressed_path.open("rb") as previous:
+                    while chunk := previous.read(1024 * 1024):
+                        target.write(chunk)
+            with path.open("rb") as source, gzip.GzipFile(
+                fileobj=target, mode="wb", compresslevel=1
+            ) as compressed:
+                while chunk := source.read(1024 * 1024):
+                    compressed.write(chunk)
+        with tmp_path.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, compressed_path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        path.unlink()
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def intercept_vf_logging(logger: str = "verifiers", level: str = "DEBUG", prefix: str | None = None):

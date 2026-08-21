@@ -22,6 +22,7 @@ from prime_rl.inference.vllm.serving_tokens import (
     PrimeRlGenerateResponse,
     PrimeRlGenerateResponseChoice,
     PrimeRlServingTokens,
+    _abort_on_disconnect,
     _build_usage,
     _client_set_max_tokens,
     _FinalOutputCapture,
@@ -47,6 +48,15 @@ class _FakeRawRequest:
         return self._body
 
 
+class _DisconnectingRequest:
+    def __init__(self):
+        self.checks = 0
+
+    async def is_disconnected(self):
+        self.checks += 1
+        return self.checks > 1
+
+
 async def _empty_request_outputs():
     if False:
         yield
@@ -58,6 +68,23 @@ def test_subclass_only_overrides_serve_tokens():
         PrimeRlServingTokens.serve_tokens_full_generator
         is not PrimeRlServingTokens.__mro__[1].serve_tokens_full_generator
     )
+
+
+def test_non_streaming_generation_is_cancelled_when_client_disconnects():
+    cancelled = False
+
+    async def _generation():
+        nonlocal cancelled
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled = True
+            return "aborted"
+
+    result = asyncio.run(_abort_on_disconnect(_generation(), _DisconnectingRequest(), poll_seconds=0.001))
+
+    assert result == "aborted"
+    assert cancelled
 
 
 def test_serialize_routed_experts_uses_compact_raw_payload():

@@ -26,9 +26,10 @@ delegates to upstream so we track future vLLM changes for free.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator, AsyncIterable
 from functools import cached_property
-from typing import Any
+from typing import Any, Awaitable, TypeVar
 
 from fastapi import Request
 from vllm.entrypoints.openai.engine.protocol import (
@@ -48,6 +49,28 @@ from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from prime_rl.inference.vllm.routed_experts import RoutedExpertsCapture
+
+T = TypeVar("T")
+
+
+async def _abort_on_disconnect(
+    response: Awaitable[T], raw_request: Request | None, poll_seconds: float = 0.25
+) -> T:
+    """Cancel non-streaming generation when its HTTP client goes away."""
+    if raw_request is None:
+        return await response
+
+    task = asyncio.create_task(response)
+    try:
+        while not task.done() and not await raw_request.is_disconnected():
+            await asyncio.wait((task,), timeout=poll_seconds)
+        if not task.done():
+            task.cancel()
+        return await task
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 class PrimeRlGenerateResponseChoice(GenerateResponseChoice):
@@ -300,7 +323,12 @@ class PrimeRlServingTokens(ServingTokens):
             )
 
         return await self.serve_tokens_full_generator(
-            request, result_generator, request_id, model_name, request_metadata
+            request,
+            result_generator,
+            request_id,
+            model_name,
+            request_metadata,
+            raw_request=raw_request,
         )
 
     async def serve_tokens_full_generator(  # type: ignore[override]
@@ -310,6 +338,7 @@ class PrimeRlServingTokens(ServingTokens):
         request_id: str,
         model_name: str,
         request_metadata: RequestResponseMetadata,
+        raw_request: Request | None = None,
     ) -> ErrorResponse | GenerateResponse:
         # Capture routed_experts as vLLM streams request outputs, then post-process
         # the final response into our GenerateResponse subclass so the encoded
@@ -330,8 +359,11 @@ class PrimeRlServingTokens(ServingTokens):
         final_capture = _FinalOutputCapture(result_generator)
         result_generator = final_capture
 
-        response = await super().serve_tokens_full_generator(
-            request, result_generator, request_id, model_name, request_metadata
+        response = await _abort_on_disconnect(
+            super().serve_tokens_full_generator(
+                request, result_generator, request_id, model_name, request_metadata
+            ),
+            raw_request,
         )
 
         if not isinstance(response, GenerateResponse):

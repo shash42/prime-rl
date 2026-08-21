@@ -99,6 +99,7 @@ class FileSystemTrainingBatchReceiver(TrainingBatchReceiver):
                 try:
                     with open(batch_path, "rb") as f:
                         batch: TrainingBatch = self.decoder.decode(f.read())
+                    batch_path.unlink()
                     batch.run_idx = idx
                     batches.append(batch)
                     # Increment received step to avoid reading the same file again
@@ -165,7 +166,9 @@ class FileSystemMicroBatchReceiver(MicroBatchReceiver):
 
     def receive(self) -> list[MicroBatch]:
         """Read and return the micro batches from disk."""
-        with open(self._get_micro_batch_path(), "rb") as f:
+        path = self._get_micro_batch_path()
+        with open(path, "rb") as f:
             micro_batches: list[MicroBatch] = self.decoder.decode(f.read())
+        path.unlink()
         self.current_step += 1
         return micro_batches

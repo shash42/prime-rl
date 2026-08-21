@@ -60,6 +60,7 @@ from prime_rl.orchestrator.types import (
     TrainBatch,
 )
 from prime_rl.orchestrator.utils import (
+    compress_rollouts,
     get_weight_dir,
     intercept_vf_logging,
     save_rollouts,
@@ -76,7 +77,11 @@ from prime_rl.utils.config import to_toml_dict
 from prime_rl.utils.heartbeat import Heartbeat
 from prime_rl.utils.logger import format_time, get_logger, setup_logger
 from prime_rl.utils.monitor import setup_monitor
-from prime_rl.utils.pathing import get_log_dir, get_trace_path
+from prime_rl.utils.pathing import (
+    get_log_dir,
+    get_rollout_summary_path,
+    get_trace_path,
+)
 from prime_rl.utils.usage_reporter import UsageReporter
 from prime_rl.utils.utils import (
     clean_exit,
@@ -490,7 +495,14 @@ class Orchestrator:
             await asyncio.to_thread(
                 save_rollouts,
                 [rollout.to_record()],
-                get_trace_path(self.config.output_dir, step, rollout.kind, "all"),
+                get_trace_path(self.config.output_dir, step, rollout.kind),
+            )
+            await asyncio.to_thread(
+                save_rollouts,
+                [rollout.to_summary_record()],
+                get_rollout_summary_path(
+                    self.config.output_dir, step, rollout.kind, "all"
+                ),
             )
 
             if rollout.kind == "eval":
@@ -513,6 +525,11 @@ class Orchestrator:
         done all data-transformation work."""
         config = self.config
         step = self.progress.step
+
+        for rollout in batch.rollouts:
+            rollout.metrics.setdefault(
+                "answer_tokens", float(len(self.tokenizer.encode(rollout.last_reply, add_special_tokens=False)))
+            )
 
         # Sink-to-sink cycle time — the actual time between batches, not
         # including the orchestrator's ship I/O (overlapped with the
@@ -552,17 +569,23 @@ class Orchestrator:
                 f"({n_trainable / len(batch.rollouts):.1%}) — consider reviewing task difficulty / filter config"
             )
 
-        # The effective (clean, trained-on) subset lands in the per-step ``effective`` trace file
-        # at ship time; the full arrival window already streamed into ``all`` on arrival.
-        # to_record drops the per-node training tensors — they're for training, not the rollout
-        # record, and can't round-trip json (raw numpy bytes).
+        # Full trajectories exist once under ``all``. Effective summaries carry
+        # IDs and scoring metadata without duplicating messages.
         effective = batch.rollouts.effective
-        records = [r.to_record() for r in effective]
-        await asyncio.to_thread(save_rollouts, records, get_trace_path(config.output_dir, step, "train", "effective"))
+        summaries = [rollout.to_summary_record() for rollout in effective]
+        await asyncio.to_thread(
+            save_rollouts,
+            summaries,
+            get_rollout_summary_path(config.output_dir, step, "train", "effective"),
+        )
 
         await self.sender.send(TrainingBatch(examples=batch.samples, step=step))
         self.progress.step += 1
         self.update_dispatch_gate()
+        await asyncio.to_thread(
+            compress_rollouts,
+            get_trace_path(config.output_dir, step, "train"),
+        )
         # Checkpoint the step we just shipped (resume point: continue at step + 1).
         save_ckpt_time = await self.maybe_save_ckpt(step)
         trim_process_memory()
@@ -768,13 +791,24 @@ class Orchestrator:
             get_logger().warning(f"Eval @ step={batch.step} env={batch.env_name}: no rollouts returned, skipping log")
             return
 
-        # The non-errored subset lands in the per-step ``effective`` trace file on epoch
-        # completion (multiple eval envs share the step file — each epoch appends its cohort
-        # once, and every record carries ``env_name``); the full returned cohort already
-        # streamed into ``all`` on arrival.
-        records = [r.to_record() for r in batch.rollouts.effective]
+        for rollout in batch.rollouts:
+            rollout.metrics.setdefault(
+                "answer_tokens", float(len(self.tokenizer.encode(rollout.last_reply, add_special_tokens=False)))
+            )
+
+        # Full trajectories already streamed into ``all``. Effective summaries
+        # identify the non-errored subset without storing the messages twice.
+        summaries = [rollout.to_summary_record() for rollout in batch.rollouts.effective]
         await asyncio.to_thread(
-            save_rollouts, records, get_trace_path(self.config.output_dir, batch.step, "eval", "effective")
+            save_rollouts,
+            summaries,
+            get_rollout_summary_path(
+                self.config.output_dir, batch.step, "eval", "effective"
+            ),
+        )
+        await asyncio.to_thread(
+            compress_rollouts,
+            get_trace_path(self.config.output_dir, batch.step, "eval"),
         )
         self.monitor.log_eval_samples(batch.rollouts, env_name=batch.env_name, step=batch.step)
         policy_versions = {r.policy_version for r in batch.rollouts}

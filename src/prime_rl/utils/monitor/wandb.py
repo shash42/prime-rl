@@ -26,6 +26,43 @@ if TYPE_CHECKING:
     from prime_rl.orchestrator.types import Rollout
 
 
+def _details_routing_enabled() -> bool:
+    return os.environ.get("PRIME_WANDB_DETAILS") == "1"
+
+
+def route_default_workspace_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Keep a small mean-only surface and put native PRIME metrics under details/."""
+    routed = {(key if key == "step" else f"details/{key}"): value for key, value in metrics.items()}
+    aliases = {
+        "train/agg/effective/reward/mean": "train/reward",
+        "entropy/all/mean": "train/entropy",
+        "mismatch_kl/all/mean": "train/sample_policy_kl",
+        "optim/lr": "train/lr",
+        "loss/mean": "train/loss",
+        "optim/grad_norm": "train/grad_norm",
+        "train/agg/effective/num_output_tokens/mean": "train/mean_total_output_tokens",
+        "train/agg/effective/metrics/answer_tokens/mean": "train/mean_answer_tokens",
+        "train/agg/all/is_truncated/mean": "train/truncation_rate",
+        "train/agg/all/has_error/mean": "train/error_rate",
+    }
+    for source, target in aliases.items():
+        if source in metrics:
+            routed[target] = metrics[source]
+
+    eval_metrics = {
+        "effective/metrics/rel_infogain/mean": "rel_infogain",
+        "effective/num_output_tokens/mean": "mean_total_output_tokens",
+        "effective/metrics/answer_tokens/mean": "mean_answer_tokens",
+        "all/is_truncated/mean": "truncation_rate",
+        "all/has_error/mean": "error_rate",
+    }
+    for key, value in metrics.items():
+        match = re.fullmatch(r"eval/(pasttest|futuretest)/(.+)", key)
+        if match and match.group(2) in eval_metrics:
+            routed[f"eval/{match.group(1)}/{eval_metrics[match.group(2)]}"] = value
+    return routed
+
+
 def _loggable_task(task) -> str:
     """A Table-safe JSON string of the task for sample logging. Image content parts are elided to
     a short placeholder — their base64 data bloats the table and breaks wandb Table's nested-type
@@ -141,7 +178,7 @@ class WandbMonitor(Monitor):
         # Provision the curated "overview" saved view once per project (the run's primary process
         # in shared mode, else the single master). Best-effort: a workspaces/API failure must never
         # take down training.
-        if is_online and (primary if shared_mode else True):
+        if is_online and not _details_routing_enabled() and (primary if shared_mode else True):
             try:
                 url = ensure_overview_view(
                     self.wandb.entity,
@@ -186,6 +223,8 @@ class WandbMonitor(Monitor):
             return
         if not self.enabled:
             return
+        if _details_routing_enabled():
+            metrics = route_default_workspace_metrics(metrics)
         wandb.log({**metrics, "step": step})
 
     def log_samples(self, rollouts: list[Rollout], step: int) -> None:
@@ -236,7 +275,8 @@ class WandbMonitor(Monitor):
                 )
                 self.samples_table.add_data(*sample.values())
 
-        wandb.log({"samples": self.samples_table, "step": step})
+        key = "details/samples" if _details_routing_enabled() else "samples"
+        wandb.log({key: self.samples_table, "step": step})
         self.last_log_samples_step = step
         self.logger.debug(f"Logged samples at step {step} to W&B table in {time.perf_counter() - start_time:.2f}s")
 
@@ -270,7 +310,8 @@ class WandbMonitor(Monitor):
                 }
                 self.eval_samples_table.add_data(*sample.values())
 
-        wandb.log({"eval/samples": self.eval_samples_table, "step": step})
+        key = "details/eval/samples" if _details_routing_enabled() else "eval/samples"
+        wandb.log({key: self.eval_samples_table, "step": step})
 
     def log_distributions(self, distributions: dict[str, list[float]], step: int) -> None:
         """Log distributions (no-op for W&B)."""
