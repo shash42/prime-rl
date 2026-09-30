@@ -150,7 +150,10 @@ def _patch_qwen3_5_linear_attn_varlen():
     _gdn_orig = Qwen3_5GatedDeltaNet.forward
 
     def _gdn_forward(self, hidden_states, cache_params=None, attention_mask=None, cu_seqlens=None):
-        if cu_seqlens is None or cache_params is not None:
+        # Stack-packed SFT keeps examples in independent batch rows, so the
+        # ordinary batched convolution is already isolated. ``seq_idx`` below
+        # is only needed for multiple sequences concatenated into one row.
+        if cu_seqlens is None or cache_params is not None or hidden_states.shape[0] > 1:
             return _gdn_orig(self, hidden_states, cache_params=cache_params, attention_mask=attention_mask)
 
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
@@ -479,11 +482,6 @@ def get_model(
 
     is_vlm_training = config.vlm is not None
 
-    if "Qwen3.5" in config.name or "qwen3_5" in config.name.lower():
-        _patch_qwen3_5_text_position_ids()
-        _patch_qwen3_5_moe_conversion_mapping()
-        _patch_qwen3_5_linear_attn_varlen()
-
     model_config = cast(
         PretrainedConfig,
         AutoConfig.from_pretrained(
@@ -517,11 +515,12 @@ def get_model(
 
         _hub_kernels._kernels_enabled = True
 
-    # Fallback Qwen3.5 patch detection from loaded config model_type
-    if getattr(model_config, "model_type", "").startswith("qwen3_5_moe"):
+    # Checkpoint directories need not contain the architecture's name.
+    if getattr(model_config, "model_type", "").startswith("qwen3_5"):
         _patch_qwen3_5_text_position_ids()
         _patch_qwen3_5_moe_conversion_mapping()
         _patch_qwen3_5_linear_attn_varlen()
+        logger.info("Applied Qwen3.5 position-ID and packed linear-attention fixes")
     for subconfig_key in getattr(model_config, "sub_configs", {}):
         subconfig = getattr(model_config, subconfig_key, None)
         if subconfig is not None and hasattr(subconfig, "use_cache"):
@@ -637,9 +636,14 @@ def get_model(
             )
         logger.debug(f"Loaded model {config.name} in {time.perf_counter() - load_model_start_time:.2f} seconds")
 
-    # For VLM models, optionally freeze the vision encoder
+    # For VLM models, optionally freeze the vision encoder during multimodal
+    # training. Text-only use of a VLM architecture never sends images through
+    # the vision encoder, so freeze it to keep unused parameters out of the
+    # optimizer and its checkpoint state.
     if is_vlm_training and config.vlm.freeze_vision_encoder:
         freeze_vision_encoder(model, override_attr=config.vlm.vision_encoder_attr)
+    elif is_vlm_arch:
+        freeze_vision_encoder(model)
 
     assert model.lm_head.weight.dtype == dtype, (
         f"LM head dtype wasnt loaded correctly {model.lm_head.weight.dtype} != {dtype}"

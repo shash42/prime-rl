@@ -286,19 +286,20 @@ def train(config: SFTConfig):
         total_token_count = torch.tensor(0, dtype=torch.int64, device="cuda")
         nan_count = torch.tensor(0, device="cuda")
 
-        # Variable-length packing yields different per-rank batch counts. Under FSDP
-        # every forward is a collective, so all ranks must agree on when to stop —
-        # otherwise the first rank to exit deadlocks the rest in the next all-gather.
-        # Sync per batch and exit together as soon as any rank exhausts its iterator.
-        data_iter = iter(data_iter)
+        # Variable-length packing yields different per-rank batch counts. Run to
+        # the global maximum and give shorter ranks loss-masked dummy batches so
+        # FSDP collectives stay aligned without dropping another rank's tail.
+        batches = list(data_iter)
+        batch_count = torch.tensor(len(batches), dtype=torch.int64, device="cuda")
+        dist.all_reduce(batch_count, op=dist.ReduceOp.MAX)
+        if not batches:
+            raise ValueError("validation rank received no batches")
+        dummy_batch = {key: value.clone() for key, value in batches[-1].items()}
+        dummy_batch["loss_mask"].zero_()
 
         with torch.no_grad():
-            while True:
-                micro_batch = next(data_iter, None)
-                has_data = torch.tensor(micro_batch is not None, dtype=torch.int32, device="cuda")
-                dist.all_reduce(has_data, op=dist.ReduceOp.MIN)
-                if has_data.item() == 0:
-                    break
+            for batch_index in range(batch_count.item()):
+                micro_batch = batches[batch_index] if batch_index < len(batches) else dummy_batch
                 loss_sum, token_count = compute_loss(micro_batch)
                 if not torch.isnan(loss_sum.detach()):
                     total_loss_sum += loss_sum.detach()
@@ -419,12 +420,9 @@ def train(config: SFTConfig):
                 if param.grad is not None:
                     param.grad.mul_(grad_scale)
 
-        # Run validation after forward-backward (so torch.compile sees training graph first) but before
-        # optimizer step (so eval_on_start evaluates untrained weights)
-        if config.val is not None and (
-            (is_first_step and config.val.eval_on_start)
-            or (not is_first_step and progress.step % config.val.interval == 0)
-        ):
+        # The initial validation runs after the first compiled forward/backward
+        # but before its optimizer update, so it evaluates the starting weights.
+        if config.val is not None and is_first_step and config.val.eval_on_start:
             run_validation(progress.step)
 
         # Compute the global mean loss for logging.
@@ -453,6 +451,10 @@ def train(config: SFTConfig):
         # Update learning rate scheduler
         current_lr = optimizer.param_groups[0]["lr"]
         scheduler.step()
+
+        # Periodic validation is labeled by completed optimizer updates.
+        if config.val is not None and not is_first_step and progress.step % config.val.interval == 0:
+            run_validation(progress.step)
 
         # Checkpoint the step we just finished. The last step's checkpoint is written once after
         # the loop, so skip it here to avoid a double-save.

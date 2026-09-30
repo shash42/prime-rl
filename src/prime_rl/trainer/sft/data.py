@@ -243,12 +243,14 @@ class SFTDataset(StatefulIterableDataset):
                 )
                 self._warned_chat_template_kwargs = True
 
-            input_ids, loss_mask = build_training_sample(
+            rendered_sample = build_training_sample(
                 self.renderer,
                 messages,
                 role_to_mask=should_mask,
                 tools=tools,
             )
+            input_ids = rendered_sample.token_ids
+            loss_mask = rendered_sample.loss_mask
         else:
             try:
                 input_ids, loss_mask = build_incremental_token_mask(
@@ -466,6 +468,9 @@ class StackDataset(StatefulIterableDataset):
                     num_samples += 1
                     for key, value in bucket_item.items():
                         pad_tokens = [0] * (self.bucket_sizes[bucket_idx] - len(value))
+                        if key == "position_ids":
+                            # Padding continues the row; zeroes would create one sequence per pad token.
+                            pad_tokens = list(range(value[-1] + 1, value[-1] + 1 + len(pad_tokens)))
                         if key == "loss_mask":
                             num_tokens += len(value)
                             num_trainable_tokens += sum(value)
@@ -484,6 +489,26 @@ class StackDataset(StatefulIterableDataset):
             else:
                 if self.bucket_timers[bucket_idx] is None:
                     self.bucket_timers[bucket_idx] = self.step
+
+        # Finite datasets (notably SFT validation) can end with partially filled
+        # buckets. Flush them with loss-masked dummy rows so every real example
+        # contributes exactly once.
+        for bucket_idx, bucket in enumerate(self.buckets):
+            if not bucket:
+                continue
+            while self.bucket_sizes[bucket_idx] * len(bucket) < self.max_area:
+                bucket.append({key: [0] for key in bucket[0]})
+            packed_samples = defaultdict(list)
+            for bucket_item in bucket:
+                for key, value in bucket_item.items():
+                    pad_tokens = [0] * (self.bucket_sizes[bucket_idx] - len(value))
+                    if key == "position_ids":
+                        pad_tokens = list(range(value[-1] + 1, value[-1] + 1 + len(pad_tokens)))
+                    packed_samples[key].append(value + pad_tokens)
+            yield packed_samples
+            self.step += 1
+            self.buckets[bucket_idx] = []
+            self.bucket_timers[bucket_idx] = None
 
 
 def stack_collate(samples: list[Sample]) -> Batch:

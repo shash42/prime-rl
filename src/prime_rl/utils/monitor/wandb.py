@@ -42,6 +42,7 @@ def route_default_workspace_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         "optim/grad_norm": "train/grad_norm",
         "train/agg/effective/num_output_tokens/mean": "train/mean_total_output_tokens",
         "train/agg/effective/metrics/answer_tokens/mean": "train/mean_answer_tokens",
+        "train/agg/all/metrics/relppl/mean": "train/relppl",
         "train/agg/all/is_truncated/mean": "train/truncation_rate",
         "train/agg/all/has_error/mean": "train/error_rate",
     }
@@ -50,7 +51,7 @@ def route_default_workspace_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
             routed[target] = metrics[source]
 
     eval_metrics = {
-        "effective/metrics/rel_infogain/mean": "rel_infogain",
+        "effective/metrics/relppl/mean": "relppl",
         "effective/num_output_tokens/mean": "mean_total_output_tokens",
         "effective/metrics/answer_tokens/mean": "mean_answer_tokens",
         "all/is_truncated/mean": "truncation_rate",
@@ -178,7 +179,7 @@ class WandbMonitor(Monitor):
         # Provision the curated "overview" saved view once per project (the run's primary process
         # in shared mode, else the single master). Best-effort: a workspaces/API failure must never
         # take down training.
-        if is_online and not _details_routing_enabled() and (primary if shared_mode else True):
+        if is_online and (primary if shared_mode else True):
             try:
                 url = ensure_overview_view(
                     self.wandb.entity,
@@ -187,7 +188,7 @@ class WandbMonitor(Monitor):
                     eval_envs=eval_env_names,
                 )
                 if url:
-                    self.logger.info(f"Created W&B overview view - {url}")
+                    self.logger.info(f"Updated W&B overview view - {url}")
             except Exception as e:
                 self.logger.warning(f"Failed to create W&B overview view - {e}")
 
@@ -338,8 +339,7 @@ class WandbMonitor(Monitor):
 
 OVERVIEW_NAME = "overview"
 
-# Per-rollout metrics (under "<scope>/all/") shown for BOTH train and eval. Only the reward metric
-# differs — train uses "reward/mean", eval uses "avg@k" — and each section builder prepends its own.
+# Additional per-rollout metrics shown for evaluation.
 COMMON_METRICS = [
     "has_error/mean",
     "is_truncated/mean",
@@ -355,6 +355,9 @@ PERFORMANCE_METRICS = [
     "time/step",
     "time/wait_for_batch",
     "time/wait_for_policy",
+    "time/forward_backward",
+    "train/agg/all/timing/generation/mean",
+    "train/agg/all/metrics/reader_seconds/mean",
     "inference/agg/throughput",
     "inference/agg/running_requests",
     "inference/agg/waiting_requests",
@@ -371,27 +374,36 @@ def line_panels(metrics: Sequence[str], regexes: Sequence[str]) -> list[wr.LineP
     # inference/* is logged against wall time (step_metric="_timestamp") → "WallTime" (== W&B's
     # "_timestamp"); everything else on "step" (prime-rl's logged training step, not internal "Step").
     # x is set per-panel because LinePlot defaults it to "Step", which overrides the workspace x_axis.
-    return [wr.LinePlot(x="WallTime" if m.startswith("inference/") else "step", y=[m]) for m in metrics] + [
+    return [
+        wr.LinePlot(x="WallTime" if m.removeprefix("details/").startswith("inference/") else "step", y=[m])
+        for m in metrics
+    ] + [
         wr.LinePlot(x="step", metric_regex=r) for r in regexes
     ]
 
 
 def section(name: str, metrics: Sequence[str] = (), regexes: Sequence[str] = ()) -> ws.Section:
+    prefix = "details/" if _details_routing_enabled() else ""
     return ws.Section(
         name=name,
         is_open=True,
-        panels=line_panels(metrics, regexes),
+        panels=line_panels([prefix + m for m in metrics], [prefix + r for r in regexes]),
         layout_settings=ws.SectionLayoutSettings(columns=COLUMNS, rows=ROWS),
     )
 
 
 def train_section(name: str, scope: str) -> ws.Section:
-    return section(name, metrics=[f"{scope}/all/reward/mean"] + [f"{scope}/all/{m}" for m in COMMON_METRICS])
+    return section(
+        name,
+        metrics=[f"{scope}/all/reward/{stat}" for stat in ("mean", "p10", "p90")]
+        + ["optim/grad_norm"]
+        + [f"{scope}/all/metrics/relppl/{stat}" for stat in ("mean", "p10", "p90")]
+        + [f"{scope}/all/num_total_tokens/mean"],
+    )
 
 
 def eval_section(name: str, env_pattern: str) -> ws.Section:
-    # Same metrics as train, but eval's reward is "avg@k" (dynamic k → regex). Everything is a regex so
-    # one section can also serve any env (env_pattern=".*"). Only the "all" subset, like train.
+    # Eval's score is "avg@k" (dynamic k → regex); these regexes can also cover any env.
     return section(
         name,
         regexes=[f"eval/{env_pattern}/all/avg@.*"] + [f"eval/{env_pattern}/all/{m}" for m in COMMON_METRICS],
@@ -435,23 +447,31 @@ def list_views(entity: str, project: str) -> list[tuple[str, str]]:
     return [(e["node"]["displayName"], e["node"]["name"]) for e in edges if e.get("node")]
 
 
-def env_signature(train_envs: Sequence[str], eval_envs: Sequence[str]) -> tuple:
-    return (tuple(sorted(train_envs)), tuple(sorted(eval_envs)))
-
-
-def view_env_signature(sections: Sequence[ws.Section]) -> tuple:
-    """Reconstruct the ``(train, eval)`` env set a view was built for from its section names."""
-    train = sorted(s.name[len("train/") :] for s in sections if s.name.startswith("train/") and s.name != "train/agg")
-    evals = sorted(s.name[len("eval/") :] for s in sections if s.name.startswith("eval/"))
-    return (tuple(train), tuple(evals))
-
-
-def next_overview_name(base: str, existing: Sequence[str]) -> str:
-    if base not in existing:
-        return base
-    prefix = f"{base}-v"
-    versions = [1] + [int(n[len(prefix) :]) for n in existing if n.startswith(prefix) and n[len(prefix) :].isdigit()]
-    return f"{base}-v{max(versions) + 1}"
+def merge_overview_sections(target: list[ws.Section], incoming: Sequence[ws.Section]) -> bool:
+    """Keep existing charts and add missing sections or metrics in place."""
+    changed = False
+    by_name = {section.name: section for section in target}
+    for section in incoming:
+        if section.name not in by_name:
+            target.append(section)
+            by_name[section.name] = section
+            changed = True
+            continue
+        existing = by_name[section.name]
+        for panel in section.panels:
+            if isinstance(panel, wr.LinePlot):
+                duplicate = any(
+                    isinstance(other, wr.LinePlot)
+                    and (other.x, other.y, other.metric_regex) == (panel.x, panel.y, panel.metric_regex)
+                    for other in existing.panels
+                )
+            else:
+                duplicate = panel in existing.panels
+            if not duplicate:
+                panel.layout.y = max((p.layout.y + p.layout.h for p in existing.panels), default=0)
+                existing.panels.append(panel)
+                changed = True
+    return changed
 
 
 def ensure_overview_view(
@@ -461,27 +481,21 @@ def ensure_overview_view(
     train_envs: Sequence[str] = (),
     eval_envs: Sequence[str] = (),
 ) -> str | None:
-    """Ensure an overview saved view exists for this run's env set. Reuses an existing overview built
-    for the same envs; when the env set is new, creates a fresh versioned view (``overview`` →
-    ``overview-v2`` → …). Returns the URL of a newly created view, else None."""
-    target = env_signature(train_envs, eval_envs)
-    overviews = [(dn, iname) for dn, iname in list_views(entity, project) if dn == name or dn.startswith(f"{name}-v")]
-    for _, internal_name in overviews:
-        slug = internal_name.removeprefix("nw-").removesuffix("-v")
-        try:
-            existing = ws.Workspace.from_url(f"https://wandb.ai/{entity}/{project}?nw={slug}")
-            matches = view_env_signature(existing.sections) == target
-        except Exception as e:
-            # A single unreadable view must not abort reuse detection / versioning for the rest.
-            get_logger().warning(f"Could not inspect overview view {internal_name} - {e}")
-            continue
-        if matches:
-            return None
+    """Update the single overview in place, retaining charts from previous runs."""
+    sections = build_sections(train_envs, eval_envs)
+    for display_name, internal_name in list_views(entity, project):
+        if display_name == name:
+            slug = internal_name.removeprefix("nw-").removesuffix("-v")
+            workspace = ws.Workspace.from_url(f"https://wandb.ai/{entity}/{project}?nw={slug}")
+            if not merge_overview_sections(workspace.sections, sections):
+                return None
+            workspace.save()
+            return workspace.url
     workspace = ws.Workspace(
         entity=entity,
         project=project,
-        name=next_overview_name(name, [dn for dn, _ in overviews]),
-        sections=build_sections(train_envs, eval_envs),
+        name=name,
+        sections=sections,
         auto_generate_panels=False,
         settings=ws.WorkspaceSettings(x_axis="step"),
     )

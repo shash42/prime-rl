@@ -120,6 +120,9 @@ class ElasticConfig(BaseConfig):
 
 
 class ClientConfig(BaseConfig):
+    max_retries: int = Field(2, ge=0)
+    """SDK retries for renderer generation requests; independent of harness SDK retries."""
+
     wait_for_ready_timeout: int = 1800
     """Seconds to wait at startup for the inference pool to become ready. Applies to both the static health check and elastic DNS-based discovery."""
 

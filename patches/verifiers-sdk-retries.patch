@@ -1,0 +1,79 @@
+diff --git a/verifiers/v1/clients/config.py b/verifiers/v1/clients/config.py
+index d8783ee65..6f4c1e87e 100644
+--- a/verifiers/v1/clients/config.py
++++ b/verifiers/v1/clients/config.py
+@@ -35,6 +35,9 @@ class BaseClientConfig(BaseConfig):
+     headers: dict[str, str] = Field(default_factory=dict)
+     """Extra HTTP headers sent on every request."""
+ 
++    max_retries: int = Field(2, ge=0)
++    """SDK retries for OpenAI requests, including the training renderer connection."""
++
+     @model_validator(mode="after")
+     def apply_prime_config(self) -> "BaseClientConfig":
+         if self.api_key_var != "PRIME_API_KEY":
+@@ -109,6 +112,7 @@ def build_async_openai(config: BaseClientConfig) -> AsyncOpenAI:
+         base_url=config.base_url,
+         api_key=resolve_api_key(config),
+         default_headers=config.headers or None,
++        max_retries=config.max_retries,
+     )
+ 
+ 
+diff --git a/verifiers/v1/harnesses/null/harness.py b/verifiers/v1/harnesses/null/harness.py
+index 0cb3f0dca..7dbce3e1d 100644
+--- a/verifiers/v1/harnesses/null/harness.py
++++ b/verifiers/v1/harnesses/null/harness.py
+@@ -1,9 +1,11 @@
+ import json
+ from pathlib import Path
+ 
+-from verifiers.v1.harness import Harness, HarnessConfig
++from pydantic import Field
++
+ from verifiers.v1.clients import ModelContext
+ from verifiers.v1.dialects.chat import message_to_wire
++from verifiers.v1.harness import Harness, HarnessConfig
+ from verifiers.v1.runtimes import ProgramResult, Runtime
+ from verifiers.v1.trace import Trace
+ 
+@@ -11,7 +13,7 @@ PROGRAM_SOURCE = (Path(__file__).resolve().parent / "program.py").read_text()
+ 
+ 
+ class NullHarnessConfig(HarnessConfig):
+-    pass
++    max_retries: int = Field(2, ge=0)
+ 
+ 
+ class NullHarness(Harness[NullHarnessConfig]):
+@@ -38,6 +40,7 @@ class NullHarness(Harness[NullHarnessConfig]):
+             f"--base-url={endpoint}",
+             f"--api-key={secret}",
+             f"--model={ctx.model}",
++            f"--max-retries={self.config.max_retries}",
+         ]
+         if system_prompt:
+             args.append(f"--system-prompt={system_prompt}")
+diff --git a/verifiers/v1/harnesses/null/program.py b/verifiers/v1/harnesses/null/program.py
+index 39c66755b..2558d4c9f 100644
+--- a/verifiers/v1/harnesses/null/program.py
++++ b/verifiers/v1/harnesses/null/program.py
+@@ -86,6 +86,7 @@ def parse_args() -> argparse.Namespace:
+     parser.add_argument("--base-url", required=True)
+     parser.add_argument("--api-key", required=True)
+     parser.add_argument("--model", required=True)
++    parser.add_argument("--max-retries", type=int, default=2)
+     parser.add_argument("--system-prompt", default="")
+     parser.add_argument("--prompt", default="")
+     parser.add_argument("--mcp-config", default="")
+@@ -94,7 +95,9 @@ def parse_args() -> argparse.Namespace:
+ 
+ async def main() -> None:
+     args = parse_args()
+-    client = AsyncOpenAI(base_url=args.base_url, api_key=args.api_key)
++    client = AsyncOpenAI(
++        base_url=args.base_url, api_key=args.api_key, max_retries=args.max_retries
++    )
+     config = json.loads(args.mcp_config or "{}")
+     async with AsyncExitStack() as stack:
+         tools, dispatch = (

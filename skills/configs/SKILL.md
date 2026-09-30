@@ -62,6 +62,43 @@ CLI: `--env.0.id reverse-text --env.1.id math-env`.
 
 In TOML, an empty section header (`[ckpt]`) does the same.
 
+## Generation retries
+
+Concurrent jobs sharing a host need distinct inference server/client ports,
+`inference.data_parallel_rpc_port`, and `weight_broadcast.port` (including
+explicit trainer/orchestrator copies in resolved configs). Keep external reader
+ports and local reader proxies distinct too. A startup `Address already in use`
+at NCCL's TCP store is a port collision, not an estimator or GPU failure.
+
+For centered TailRL credit in the existing GRPO pipeline, set
+`orchestrator.algo.advantage_estimator = "tailrl"` and also set it on any
+explicit per-env algorithm override. It uses sorted reward gaps divided by
+survivor counts, multiplied by the scored group size, then mean-centered;
+there is no standard-deviation normalization. Reward/length shaping happens
+before this transform. The default `"grpo"` retains reward-minus-mean credit.
+`format_invalid_reward_min = -1.0` optionally bounds malformed rewards after
+the existing worst-valid-minus-penalty shaping; all-invalid groups stay zero.
+
+Renderer SDK retries are configured with `orchestrator.model.client.max_retries`.
+The null harness has a separate `harness.max_retries` on each train/eval env.
+Set both to `0` to prevent timeout retries from starting overlapping generations
+in one rollout. These settings leave the SDK's 600-second timeout unchanged;
+non-streaming timeout errors do not provide partial token IDs/logprobs and are
+dropped rather than trained. Administrative health/weight-update retries are
+independent of these generation settings.
+
+## Resuming from another run directory
+
+When `ckpt.resume_step = N` is used with a new `output_dir`, PRIME resolves the
+trainer checkpoint, orchestrator progress, and policy weights under that new
+run directory; it does not provide a separate source-run checkpoint path.
+When reusing a checkpoint from another run, stage the required step directory
+with symlinks to the source run's matching files rather than copying large
+shards. Preserve the expected `checkpoints/step_N/trainer/`,
+`run_default/checkpoints/step_N/orchestrator/`, and `weights/step_N/` layout,
+verify every symlink resolves to the intended source file and byte size, and
+do not modify the source run while the resumed job is active.
+
 ## RL trainer token exports
 
 For rollout debugging, enable trainer-side token export with `trainer.enable_token_export = true` (or `--enable-token-export` when running the trainer entrypoint directly). It writes one JSONL record per exported sequence. Single-run/fallback exports go under `output_dir/token_exports/step_<step>/rank_<rank>.jsonl`; multi-run trainer exports with packer metadata go under the owning run directory, `output_dir/<run_id>/token_exports/step_<run_step>/rank_<rank>.jsonl`. Each record stores aligned per-token arrays for token ids, loss mask, component weight streams (rl/ce/ref_kl), advantages, entropy, mismatch KL, inference/trainer logprobs, importance ratios, probability deltas, and masking diagnostics. It does not decode token text in the trainer.
@@ -77,3 +114,11 @@ Leave it unset for normal training. When enabled, it exports every sequence from
 - `packages/prime-rl-configs/src/prime_rl/` — config classes under `configs/`; `utils/config.py` re-exports `BaseConfig` and `cli`
 - `configs/debug/` — minimal debug configs
 - `examples/` — full example configs
+
+## Qwen3.5 SFT padding
+
+With stack packing, padded position IDs must continue increasing within each row,
+including dummy rows and final partial buckets. Zero-filled padding is interpreted
+as one independent sequence per token by the variable-length attention boundary
+builder and can exceed the FLA kernel's CUDA grid limit. Keep padding loss-masked;
+this is a packing constraint, independent of the Qwen thinking renderer.

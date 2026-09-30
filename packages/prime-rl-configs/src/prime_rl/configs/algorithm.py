@@ -196,8 +196,20 @@ class GRPOAlgoConfig(BaseAlgoConfig):
 
     action_loss_type: ClassVar[ActionLossType] = "rl"
 
+    advantage_estimator: Literal["grpo", "tailrl"] = "grpo"
+    """TailRL uses gap-over-survivors weights, scaled by group size and mean-centered without std normalization."""
+
     length_penalty: LengthPenaltyConfig | None = None
     """Linear length penalty subtracted from each reward before the GRPO baseline (see ``LinearLengthPenaltyConfig``): a ``pass_rate``-scaled sum of output-token, input-token, and turns terms, each normalized by the group's own max for that quantity. None disables it."""
+
+    format_invalid_advantage: float | None = Field(default=None, allow_inf_nan=False)
+    """When set, rollouts with ``metrics['format_valid'] == 0`` receive this final advantage and are excluded from the GRPO group baseline. ``None`` preserves ordinary GRPO behavior."""
+
+    format_invalid_reward_penalty: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    """When set, invalid-format rollouts receive the group's worst valid reward minus this amount, then participate in ordinary GRPO centering. If the group has no valid rollouts, invalid-format rewards are neutral (0). Mutually exclusive with ``format_invalid_advantage``."""
+
+    format_invalid_reward_min: float | None = Field(default=None, le=0, allow_inf_nan=False)
+    """Optional lower bound on the invalid-format reward after subtracting its penalty."""
 
 
 class EchoAlgoConfig(GRPOAlgoConfig):

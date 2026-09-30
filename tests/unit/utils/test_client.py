@@ -57,6 +57,7 @@ def test_setup_clients_assigns_renderer_and_dp_rank_headers():
         api_key_var="PRIME_API_KEY",
         headers={"X-Test": "test"},
         dp_rank_count=2,
+        max_retries=0,
         extra_headers_from_state={"X-Session-ID": "session_id"},
     )
 
@@ -68,6 +69,7 @@ def test_setup_clients_assigns_renderer_and_dp_rank_headers():
     )
 
     assert [client.type for client in clients] == ["train", "train"]
+    assert [client.max_retries for client in clients] == [0, 0]
     assert [client.renderer for client in clients] == [renderer_settings, renderer_settings]
     assert [client.renderer_model_name for client in clients] == [None, None]
     assert [client.base_url for client in clients] == ["http://worker-a:8000/v1"] * 2

@@ -11,8 +11,10 @@ def test_default_workspace_routing_keeps_selected_means_only() -> None:
             "loss/mean": 0.3,
             "train/agg/effective/num_output_tokens/mean": 700.0,
             "train/agg/effective/metrics/answer_tokens/mean": 80.0,
+            "train/agg/all/metrics/relppl/mean": -0.03,
+            "train/agg/effective/metrics/relppl/mean": 0.02,
             "eval/pasttest/effective/avg@1": 1.0,
-            "eval/pasttest/effective/metrics/rel_infogain/mean": 0.1,
+            "eval/pasttest/effective/metrics/relppl/mean": 0.1,
             "eval/pasttest/effective/num_output_tokens/mean": 500.0,
             "eval/pasttest/effective/metrics/answer_tokens/mean": 60.0,
             "eval/pasttest/effective/num_output_tokens/p90": 900.0,
@@ -27,7 +29,8 @@ def test_default_workspace_routing_keeps_selected_means_only() -> None:
     assert routed["train/loss"] == 0.3
     assert routed["train/mean_total_output_tokens"] == 700.0
     assert routed["train/mean_answer_tokens"] == 80.0
-    assert routed["eval/pasttest/rel_infogain"] == 0.1
+    assert routed["train/relppl"] == -0.03
+    assert routed["eval/pasttest/relppl"] == 0.1
     assert routed["eval/pasttest/mean_total_output_tokens"] == 500.0
     assert routed["eval/pasttest/mean_answer_tokens"] == 60.0
     assert routed["eval/futuretest/error_rate"] == 0.01
